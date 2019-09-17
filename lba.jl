@@ -1,24 +1,27 @@
 using Distributions, Parameters, DynamicHMC, LogDensityProblems, TransformVariables
-using Random
+using Random, StatsFuns
 import Distributions: pdf,logpdf,rand
+
 export LBA,pdf,logpdf,rand
 
-mutable struct LBA{T1,T2,T3,T4} <: ContinuousUnivariateDistribution
+Base.@kwdef struct LBA{T1,T2,T3,T4} <: ContinuousUnivariateDistribution
     ν::T1
     A::T2
     k::T3
     τ::T4
-    σ::Float64
+    σ::Float64 = 1.0
 end
 
-Base.broadcastable(x::LBA)=Ref(x)
+Base.broadcastable(x::LBA) = Ref(x)
 
-LBA(;τ,A,k,ν,σ=1.0) = LBA(ν,A,k,τ,σ)
+###
+### simulation
+###
 
 function selectWinner(dt)
-    if any(x->x >0,dt)
-        mi,mv = 0,Inf
-        for (i,t) in enumerate(dt)
+    if any(x -> x > 0,dt)
+        mi, mv = 0, Inf
+        for (i, t) in enumerate(dt)
             if (t > 0) && (t < mv)
                 mi = i
                 mv = t
@@ -56,12 +59,18 @@ function rand(d::LBA,N::Int)
     choice = fill(0,N)
     rt = fill(0.0,N)
     for i in 1:N
-        choice[i],rt[i]=rand(d)
+        choice[i], rt[i] = rand(d)
     end
-    return (choice=choice,rt=rt)
+    return (choice = choice, rt = rt)
 end
 
-logpdf(d::LBA,choice,rt) = log(pdf(d,choice,rt))
+function simulateLBA(;Nd,v=[1.0,1.5,2.0],A=.8,k=.2,tau=.4,kwargs...)
+    return (rand(LBA(ν=v,A=A,k=k,τ=tau),Nd)...,N=Nd,Nc=length(v))
+end
+
+###
+### log densities
+###
 
 function logpdf(d::LBA,data::T) where {T<:NamedTuple}
     return sum(logpdf.(d,data...))
@@ -75,53 +84,46 @@ function logpdf(dist::LBA,data::Array{<:Tuple,1})
     return LL
 end
 
-function pdf(d::LBA,c,rt)
+function logpdf(d::LBA,c,rt)
     @unpack τ,A,k,ν,σ = d
-    b=A+k; den = 1.0
+    b = A + k
+    logden = 0.0
     rt < τ ? (return 1e-10) : nothing
     for (i,v) in enumerate(ν)
         if c == i
-            den *= dens(d,v,rt)
+            logden += logdens(d,v,rt)
         else
-            den *= (1-cummulative(d,v,rt))
+            logden += log_tail_cumulative(d,v,rt)
         end
     end
-    pneg = pnegative(d)
-    den = den/(1-pneg)
-    den = max(den,1e-10)
-    isnan(den) ? (return 0.0) : (return den)
+    logden - log1mexp(logpnegative(d))
 end
 
 logpdf(d::LBA,data::Tuple) = logpdf(d,data...)
 
-function dens(d::LBA,v,rt)
+function logdens(d::LBA, v, rt)
     @unpack τ,A,k,ν,σ = d
     dt = rt-τ; b=A+k
     n1 = (b-A-dt*v)/(dt*σ)
     n2 = (b-dt*v)/(dt*σ)
-    dens = (1/A)*(-v*cdf(Normal(0,1),n1) + σ*pdf(Normal(0,1),n1) +
-        v*cdf(Normal(0,1),n2) - σ*pdf(Normal(0,1),n2))
-    return dens
+    Δcdfs = cdf(Normal(0,1),n2) - cdf(Normal(0,1),n1)
+    Δpdfs = pdf(Normal(0,1),n1) - pdf(Normal(0,1),n2)
+    -log(A) + logaddexp(log(σ) + log(Δpdfs), log(v) * log(Δcdfs))
 end
 
-function cummulative(d::LBA,v,rt)
+function log_tail_cumulative(d::LBA,v,rt)
     @unpack τ,A,k,ν,σ = d
     dt = rt-τ; b=A+k
     n1 = (b-A-dt*v)/(dt*σ)
     n2 = (b-dt*v)/(dt*σ)
-    cm = 1 + ((b-A-dt*v)/A)*cdf(Normal(0,1),n1) -
-        ((b-dt*v)/A)*cdf(Normal(0,1),n2) + ((dt*σ)/A)*pdf(Normal(0,1),n1) -
-        ((dt*σ)/A)*pdf(Normal(0,1),n2)
-    return cm
+    log(-((b-A-dt*v)/A)*cdf(Normal(0,1),n1) +
+          ((b-dt*v)/A)*cdf(Normal(0,1),n2) - ((dt*σ)/A)*pdf(Normal(0,1),n1) +
+          ((dt*σ)/A)*pdf(Normal(0,1),n2))
 end
 
-function pnegative(d::LBA)
+function logpnegative(d::LBA)
     @unpack ν,σ=d
-    p=1.0
-    for v in ν
-        p*= cdf(Normal(0,1),-v/σ)
-    end
-    return p
+    sum(v -> logcdf(Normal(0,1),-v/σ), ν)
 end
 
 struct LBAProb{T}
@@ -133,11 +135,13 @@ end
 function (problem::LBAProb)(θ)
     @unpack data=problem
     @unpack v,A,k,tau=θ
-    d=LBA(ν=v,A=A,k=k,τ=tau)
-    minRT = minimum(x->x[2],data)
-    logpdf(d,data)+sum(logpdf.(TruncatedNormal(0,3,0,Inf),v)) +
-        logpdf(TruncatedNormal(.8,.4,0,Inf),A)+logpdf(TruncatedNormal(.2,.3,0,Inf),k)+
-    logpdf(TruncatedNormal(.4,.1,0,minRT),tau)
+    d = LBA(ν=v,A=A,k=k,τ=tau)
+    minRT = minimum(last, data)
+    logprior = (sum(logpdf.(TruncatedNormal(0,3,0,Inf), v)) +
+                logpdf(TruncatedNormal(.8,.4,0,Inf),A) +
+                logpdf(TruncatedNormal(.2,.3,0,Inf),k) +
+                logpdf(TruncatedNormal(.4,.1,0,minRT), tau))
+    loglikelihood = logpdf(d, data)
 end
 
 function sampleDHMC(choice,rt,N,Nc,nsamples)
@@ -145,29 +149,12 @@ function sampleDHMC(choice,rt,N,Nc,nsamples)
     return sampleDHMC(data,N,Nc,nsamples)
 end
 
-# Define problem with data and inits.
-function sampleDHMC(data,N,Nc,nsamples)
-    p = LBAProb(data,N,Nc)
-    p((v=fill(.5,Nc),A=.8,k=.2,tau=.4))
-    # Write a function to return properly dimensioned transformation.
-    trans = as((v=as(Array,asℝ₊,Nc),A=asℝ₊,k=asℝ₊,tau=asℝ₊))
-    # Use Flux for the gradient.
-    P = TransformedLogDensity(trans, p)
-    ∇P = ADgradient(:ForwardDiff, P)
-    # FSample from the posterior.
-    n = dimension(trans)
-    results = mcmc_with_warmup(Random.GLOBAL_RNG, ∇P, nsamples;
-        q = zeros(n), p = ones(n),reporter = NoProgressReport())
-    # Undo the transformation to obtain the posterior from the chain.
-    posterior = transform.(trans, results.chain)
-    chns = nptochain(results,posterior)
-    return chns
-end
-
-function simulateLBA(;Nd,v=[1.0,1.5,2.0],A=.8,k=.2,tau=.4,kwargs...)
-    return (rand(LBA(ν=v,A=A,k=k,τ=tau),Nd)...,N=Nd,Nc=length(v))
-end
-
-data = simulateLBA(Nd=10)
-
-samples = sampleDHMC(data...,2000)
+N = 10
+data = simulateLBA(Nd = N)
+p = LBAProb(collect(zip(data.choice, data.rt)), N, data.Nc)
+p((v=fill(.5,data.Nc),A=.8,k=.2,tau=.4))
+trans = as((v=as(Array,asℝ₊,data.Nc),A=asℝ₊,k=asℝ₊,tau=asℝ₊))
+P = TransformedLogDensity(trans, p)
+∇P = ADgradient(:ForwardDiff, P)
+results = mcmc_with_warmup(Random.GLOBAL_RNG, ∇P, 1000)
+posterior = trans.(results.chain)
