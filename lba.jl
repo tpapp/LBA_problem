@@ -76,19 +76,13 @@ function logpdf(d::LBA,data::T) where {T<:NamedTuple}
     return sum(logpdf.(d,data...))
 end
 
-function logpdf(dist::LBA,data::Array{<:Tuple,1})
-    LL = 0.0
-    for d in data
-        LL += logpdf(dist,d...)
-    end
-    return LL
-end
+logpdf(dist::LBA,data::Array{<:Tuple,1}) = sum(d -> logpdf(dist, d), data)
 
 function logpdf(d::LBA,c,rt)
     @unpack τ,A,k,ν,σ = d
     b = A + k
     logden = 0.0
-    rt < τ ? (return 1e-10) : nothing
+    rt < τ && return -Inf
     for (i,v) in enumerate(ν)
         if c == i
             logden += logdens(d,v,rt)
@@ -106,6 +100,7 @@ function logdens(d::LBA, v, rt)
     dt = rt-τ; b=A+k
     n1 = (b-A-dt*v)/(dt*σ)
     n2 = (b-dt*v)/(dt*σ)
+    # FIXME rewrite this part nicer
     Δcdfs = cdf(Normal(0,1),n2) - cdf(Normal(0,1),n1)
     Δpdfs = pdf(Normal(0,1),n1) - pdf(Normal(0,1),n2)
     -log(A) + logaddexp(log(σ) + log(Δpdfs), log(v) * log(Δcdfs))
